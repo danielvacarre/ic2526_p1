@@ -25,7 +25,7 @@ def load_gt_from_github() -> pd.DataFrame:
 st.title("Evaluator F1")
 
 gt_df = load_gt_from_github()  # NO se expone al usuario
-st.caption("Sube un CSV con columnas: id, pred")
+st.caption("Sube un CSV con columnas: id, prediction")
 
 uploaded = st.file_uploader("Tus predicciones", type=["csv"])
 if uploaded:
@@ -35,11 +35,11 @@ if uploaded:
         st.error(f"CSV inválido: {e}")
         st.stop()
 
-    required_user_cols = {"id", "pred"}
+    required_user_cols = {"id", "prediction"}
     required_gt_cols = {"id", "label"}
 
     if not required_user_cols.issubset(user_df.columns):
-        st.error("Tu CSV debe tener columnas: id, pred")
+        st.error("Tu CSV debe tener columnas: id, prediction")
         st.stop()
     if not required_gt_cols.issubset(gt_df.columns):
         st.error("El ground truth no tiene columnas: id, label")
@@ -56,7 +56,7 @@ if uploaded:
         st.error("No hubo IDs coincidentes.")
     else:
         try:
-            f1 = f1_score(merged["label"], merged["pred"], average="weighted")
+            f1 = f1_score(merged["label"], merged["prediction"], average="weighted")
             st.success(f"F1-score (weighted): {f1:.4f}")
         except Exception as e:
             st.error(f"No se pudo calcular F1: {e}")
