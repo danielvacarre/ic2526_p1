@@ -1,110 +1,236 @@
-import io, base64, hashlib, datetime as dt
+import io
+import base64
+import hashlib
+import datetime as dt
+from typing import Tuple, Optional
+
 import pandas as pd
 import requests
 import streamlit as st
 from sklearn.metrics import f1_score
 
-# ---------- CARGA DE GROUND TRUTH DESDE REPO PRIVADO ----------
-@st.cache_data(show_spinner=False)
-def load_gt_from_github() -> pd.DataFrame:
-    owner_repo = st.secrets["GT_REPO"]
-    path = st.secrets["GT_PATH"]
-    ref = st.secrets.get("GT_REF", "master")
-    headers = {
-        "Authorization": f"Bearer {st.secrets['GH_TOKEN']}",
-        "Accept": "application/vnd.github.raw",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    url = f"https://api.github.com/repos/{owner_repo}/contents/{path}?ref={ref}"
-    r = requests.get(url, headers=headers, timeout=30)
-    r.raise_for_status()
-    return pd.read_csv(io.BytesIO(r.content))
+# ------------------------------ PAGE SETUP ------------------------------
+st.set_page_config(page_title="Evaluator F1", page_icon="📊", layout="centered")
+st.title("Evaluator F1")
+st.caption("Sube un CSV con columnas: id, prediction")
 
-# ---------- UTIL: LECTURA Y ESCRITURA DEL LOG EN EL REPO PRIVADO ----------
-def _gh_headers():
+MODE_OPTIONS = ["Presencial", "Online"]
+
+# ------------------------------ CONFIG ------------------------------
+@st.cache_data(show_spinner=False)
+def _gh_headers() -> dict:
     return {
         "Authorization": f"Bearer {st.secrets['GH_TOKEN']}",
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-def read_log_from_github() -> tuple[pd.DataFrame | None, str | None]:
-    """Devuelve (df, sha). Si no existe, (None, None)."""
+@st.cache_data(show_spinner=False)
+def _gh_repo_paths() -> Tuple[str, str, str, str]:
+    """Convenience: (owner_repo, gt_path, log_path, ref)"""
     owner_repo = st.secrets["GT_REPO"]
+    gt_path = st.secrets["GT_PATH"]
     log_path = st.secrets["LOG_PATH"]
     ref = st.secrets.get("GT_REF", "master")
+    return owner_repo, gt_path, log_path, ref
+
+# ------------------------------ GROUND TRUTH LOADER ------------------------------
+@st.cache_data(show_spinner=False, ttl=300)
+def load_gt_from_github() -> pd.DataFrame:
+    """Carga el GT desde el repo privado. Soporta ficheros >1MB usando download_url.
+    Reintenta de forma ligera ante fallos transitorios.
+    """
+    owner_repo, gt_path, _, ref = _gh_repo_paths()
+
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{gt_path}?ref={ref}"
+    # Primero pedimos el JSON de metadata para evitar el límite de 1MB del 'Accept: raw'
+    r = requests.get(url, headers=_gh_headers(), timeout=30)
+    r.raise_for_status()
+    meta = r.json()
+
+    if isinstance(meta, list):
+        raise RuntimeError("GT_PATH apunta a un directorio; debe ser un archivo CSV.")
+
+    # Si GitHub devuelve el contenido embebido y es pequeño, úsalo; si no, usa download_url
+    content_b64: Optional[str] = meta.get("content")
+    encoding: Optional[str] = meta.get("encoding")
+    download_url: Optional[str] = meta.get("download_url")
+
+    if content_b64 and encoding == "base64":
+        raw_bytes = base64.b64decode(content_b64)
+    elif download_url:
+        r2 = requests.get(download_url, headers={"Authorization": _gh_headers()["Authorization"]}, timeout=60)
+        r2.raise_for_status()
+        raw_bytes = r2.content
+    else:
+        # Fallback a solicitar el raw directamente (no debería ser necesario)
+        r3 = requests.get(url, headers={**_gh_headers(), "Accept": "application/vnd.github.raw"}, timeout=60)
+        r3.raise_for_status()
+        raw_bytes = r3.content
+
+    df = pd.read_csv(io.BytesIO(raw_bytes))
+    # Validación mínima
+    expected = {"id", "target"}
+    if not expected.issubset(df.columns):
+        raise ValueError("El ground truth no tiene columnas: id, target")
+
+    # Garantiza unicidad de IDs en el GT
+    if df["id"].duplicated().any():
+        dup_count = int(df["id"].duplicated().sum())
+        st.warning(f"Se encontraron {dup_count} IDs duplicados en el ground truth; se conservará la primera ocurrencia.")
+        df = df.drop_duplicates(subset=["id"], keep="first")
+
+    return df[["id", "target"]]
+
+# ------------------------------ LOG HELPERS ------------------------------
+
+def _put_contents(owner_repo: str, log_path: str, content_bytes: bytes, sha: Optional[str]) -> None:
+    url = f"https://api.github.com/repos/{owner_repo}/contents/{log_path}"
+    body = {
+        "message": f"append score {dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()}",
+        "content": base64.b64encode(content_bytes).decode(),
+        "committer": {"name": "streamlit-bot", "email": "noreply@example.com"},
+    }
+    if sha:
+        body["sha"] = sha
+    r = requests.put(url, headers=_gh_headers(), json=body, timeout=60)
+    if r.status_code == 409:
+        raise RuntimeError("conflict")
+    r.raise_for_status()
+
+@st.cache_data(show_spinner=False)
+def read_log_from_github() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    """Devuelve (df, sha). Si no existe, (None, None)."""
+    owner_repo, _, log_path, ref = _gh_repo_paths()
     url = f"https://api.github.com/repos/{owner_repo}/contents/{log_path}?ref={ref}"
     r = requests.get(url, headers=_gh_headers(), timeout=30)
     if r.status_code == 404:
         return None, None
     r.raise_for_status()
     j = r.json()
-    content_b64 = j["content"]
-    sha = j["sha"]
-    data = base64.b64decode(content_b64)
+    content_b64 = j.get("content", "")
+    sha = j.get("sha")
+    data = base64.b64decode(content_b64) if content_b64 else b""
+    if not data:
+        return pd.DataFrame(columns=["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]), sha
     df = pd.read_csv(io.BytesIO(data))
+    # Backfill de columna 'mode' si no existía
+    if "mode" not in df.columns:
+        df["mode"] = ""
     return df, sha
+
 
 def append_log_row_to_github(row: dict):
     """Apendiza una fila al CSV de logs en GitHub (crea si no existe).
-       Maneja el SHA para evitar pisar cambios; reintenta una vez si hay conflicto."""
-    owner_repo = st.secrets["GT_REPO"]
-    log_path = st.secrets["LOG_PATH"]
+       Maneja el SHA y reintenta una vez si hay conflicto.
+       Para evitar duplicados por re-ejecuciones de Streamlit, se usa session_state.
+    """
+    owner_repo, _, log_path, _ = _gh_repo_paths()
 
-    def _put(content_bytes: bytes, sha: str | None):
-        url = f"https://api.github.com/repos/{owner_repo}/contents/{log_path}"
-        body = {
-            "message": f"append score {row.get('timestamp_utc','')}",
-            "content": base64.b64encode(content_bytes).decode(),
-        }
-        if sha:
-            body["sha"] = sha
-        # (Opcional) establece autor del commit
-        body["committer"] = {"name": "streamlit-bot", "email": "noreply@example.com"}
-        r = requests.put(url, headers=_gh_headers(), json=body, timeout=30)
-        if r.status_code == 409:  # SHA desactualizado (race condition)
-            raise RuntimeError("conflict")
-        r.raise_for_status()
-
-    # 1º: intenta leer el log actual
-    df, sha = read_log_from_github()
-    if df is None:
-        # crear desde cero
-        new_df = pd.DataFrame([row])
-        csv_bytes = new_df.to_csv(index=False).encode()
-        _put(csv_bytes, sha=None)
+    # Evita duplicados en la misma sesión
+    key = f"logged_{row['file_sha256']}_{row['f1_weighted']}_{row['n_ids']}_{row.get('mode','')}"
+    if st.session_state.get(key):
         return
 
-    # apendizar
+    # Leer log actual
+    df, sha = read_log_from_github()
+    if df is None:
+        new_df = pd.DataFrame([row])
+        csv_bytes = new_df.to_csv(index=False).encode()
+        _put_contents(owner_repo, log_path, csv_bytes, sha=None)
+        st.session_state[key] = True
+        return
+
+    # Alinea columnas esperadas
+    for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]:
+        if col not in df.columns:
+            df[col] = ""
+
     new_df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     csv_bytes = new_df.to_csv(index=False).encode()
     try:
-        _put(csv_bytes, sha=sha)
+        _put_contents(owner_repo, log_path, csv_bytes, sha)
     except RuntimeError:
-        # reintento: vuelve a leer y reintenta una vez
+        # Reintento
         df2, sha2 = read_log_from_github()
         if df2 is None:
             df2 = pd.DataFrame(columns=new_df.columns)
         new_df2 = pd.concat([df2, pd.DataFrame([row])], ignore_index=True)
         csv_bytes2 = new_df2.to_csv(index=False).encode()
-        _put(csv_bytes2, sha=sha2)
+        _put_contents(owner_repo, log_path, csv_bytes2, sha2)
+    finally:
+        st.session_state[key] = True
 
-# ---------- APP ----------
-st.title("Evaluator F1")
-st.caption("Sube un CSV con columnas: id, prediction")
+# ------------------------------ HISTORY UI ------------------------------
 
-# (Opcional) identificador del usuario
-user_id = st.text_input("Identificador (opcional)", placeholder="nombre, email o alias")
+def show_history_by_mode():
+    try:
+        history_df, _ = read_log_from_github()
+    except Exception:
+        history_df = None
 
-gt_df = load_gt_from_github()
+    st.subheader("Historial de envíos (privado)")
+    if history_df is None:
+        st.info("No hay historial disponible aún.")
+        return
 
-uploaded = st.file_uploader("Tus predicciones", type=["csv"])
-if uploaded:
+    # Normaliza columna 'mode'
+    if "mode" not in history_df.columns:
+        history_df["mode"] = ""
+
+    # Siempre muestra ambas listas, aunque estén vacías
+    for mode_label in MODE_OPTIONS:
+        mode_key = mode_label.lower()
+        subset = history_df[history_df["mode"].str.lower().eq(mode_key)] if "mode" in history_df.columns else pd.DataFrame()
+        st.markdown(f"**{mode_label}**")
+        if subset is not None and not subset.empty:
+            st.dataframe(subset.sort_values("timestamp_utc", ascending=False), use_container_width=True)
+        else:
+            empty_cols = ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]
+            st.dataframe(pd.DataFrame(columns=empty_cols), use_container_width=True)
+
+# ------------------------------ MAIN UI ------------------------------
+
+st.markdown("### 1) Sube tu CSV")
+uploaded = st.file_uploader("Tus predicciones (CSV con columnas: id, prediction)", type=["csv"])
+
+st.markdown("### 2) Identifícate y elige modalidad")
+user_id = st.text_input("Nombre (obligatorio)", placeholder="Nombre y apellidos")
+valid_name = bool(user_id and user_id.strip())
+
+modes = st.multiselect(
+    "Modalidad (selecciona una o ambas)",
+    options=MODE_OPTIONS,
+    default=["Online"],
+    help="Usaremos esta selección para registrar tus resultados en el historial."
+)
+
+if not valid_name:
+    st.warning("El nombre es obligatorio para poder calcular y registrar resultados.")
+if not modes:
+    st.warning("Debes seleccionar al menos una modalidad (Presencial u Online).")
+
+with st.spinner("Cargando ground truth..."):
+    gt_df = load_gt_from_github()
+
+st.markdown("### 3) Calcula el F1")
+run_eval = st.button("Calcular F1")
+
+if run_eval:
+    if not uploaded:
+        st.error("Primero sube un CSV válido.")
+    if not valid_name:
+        st.error("El nombre es obligatorio.")
+    if not modes:
+        st.error("Selecciona al menos una modalidad.")
+
+if run_eval and uploaded and valid_name and modes:
     try:
         user_bytes = uploaded.read()
         user_df = pd.read_csv(io.BytesIO(user_bytes))
     except Exception as e:
         st.error(f"CSV inválido: {e}")
+        show_history_by_mode()
         st.stop()
 
     required_user_cols = {"id", "prediction"}
@@ -112,10 +238,26 @@ if uploaded:
 
     if not required_user_cols.issubset(user_df.columns):
         st.error("Tu CSV debe tener columnas: id, prediction")
+        show_history_by_mode()
         st.stop()
     if not required_gt_cols.issubset(gt_df.columns):
         st.error("El ground truth no tiene columnas: id, target")
+        show_history_by_mode()
         st.stop()
+
+    # Limpieza mínima
+    if user_df["id"].duplicated().any():
+        du = int(user_df["id"].duplicated().sum())
+        st.warning(f"Tu CSV tiene {du} IDs duplicados; se conservará la primera ocurrencia.")
+        user_df = user_df.drop_duplicates(subset=["id"], keep="first")
+
+    gt_df["id"], user_df["id"] = gt_df["id"].astype(str), user_df["id"].astype(str)
+
+    # Eliminar filas con NA en prediction o target
+    before = len(user_df)
+    user_df = user_df.dropna(subset=["prediction"])
+    if len(user_df) < before:
+        st.info(f"Se eliminaron {before - len(user_df)} filas con prediction vacía.")
 
     merged = pd.merge(
         gt_df[list(required_gt_cols)],
@@ -126,36 +268,59 @@ if uploaded:
     )
     if merged.empty:
         st.error("No hubo IDs coincidentes.")
+        show_history_by_mode()
         st.stop()
 
+    # Alinea tipos de etiquetas
     try:
-        f1 = f1_score(merged["target"], merged["prediction"], average="weighted")
-        st.success(f"F1-score (weighted): {f1:.4f}")
+        if pd.api.types.is_numeric_dtype(merged["target"]) and not pd.api.types.is_numeric_dtype(merged["prediction"]):
+            merged["prediction"] = pd.to_numeric(merged["prediction"], errors="coerce")
+        elif not pd.api.types.is_numeric_dtype(merged["target"]) and pd.api.types.is_numeric_dtype(merged["prediction"]):
+            merged["prediction"] = merged["prediction"].astype(str)
+    except Exception:
+        pass
+
+    na_before = len(merged)
+    merged = merged.dropna(subset=["target", "prediction"])
+    if len(merged) < na_before:
+        st.info(f"Se eliminaron {na_before - len(merged)} filas con etiquetas no válidas tras normalización.")
+
+    # Cálculo del F1
+    try:
+        f1_w = f1_score(merged["target"], merged["prediction"], average="weighted")
+        st.success(f"F1-score (weighted): {f1_w:.4f}")
+        with st.expander("Detalles del conjunto evaluado"):
+            st.write({
+                "n_ids_merged": int(len(merged)),
+                "n_gt": int(len(gt_df)),
+                "n_user": int(len(user_df)),
+                "n_unique_targets": int(merged["target"].nunique()),
+                "n_unique_predictions": int(merged["prediction"].nunique()),
+            })
     except Exception as e:
         st.error(f"No se pudo calcular F1: {e}")
+        show_history_by_mode()
         st.stop()
 
     # ----- Guardar en historial -----
-    # hash del fichero del usuario (para detectar duplicados sin almacenar el contenido):
     file_sha256 = hashlib.sha256(user_bytes).hexdigest()
-    row = {
-        "timestamp_utc": dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
-        "user_id": user_id or "",
-        "file_sha256": file_sha256,
-        "n_ids": int(len(merged)),
-        "f1_weighted": float(f1),
-    }
-    try:
-        append_log_row_to_github(row)
-        st.info("Resultado guardado en el historial privado.")
-    except Exception as e:
-        st.warning(f"No se pudo guardar el historial: {e}")
+    timestamp_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    # ----- Mostrar historial (solo lectura) -----
-    try:
-        history_df, _ = read_log_from_github()
-        if history_df is not None and not history_df.empty:
-            st.subheader("Historial de envíos (privado)")
-            st.dataframe(history_df.sort_values("timestamp_utc", ascending=False), use_container_width=True)
-    except Exception:
-        pass
+    for m in modes:
+        row = {
+            "timestamp_utc": timestamp_utc,
+            "user_id": user_id.strip(),
+            "file_sha256": file_sha256,
+            "n_ids": int(len(merged)),
+            "f1_weighted": float(f1_w),
+            "mode": m.lower(),
+        }
+        try:
+            append_log_row_to_github(row)
+        except Exception as e:
+            st.warning(f"No se pudo guardar el historial ({m}): {e}")
+    else:
+        st.info("Resultado(s) guardado(s) en el historial privado.")
+
+# ----- Mostrar historial (siempre disponible) -----
+show_history_by_mode()
