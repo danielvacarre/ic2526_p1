@@ -12,7 +12,7 @@ from sklearn.metrics import f1_score
 # ------------------------------ PAGE SETUP ------------------------------
 st.set_page_config(page_title="Evaluator F1", page_icon="📊", layout="centered")
 st.title("Evaluator F1")
-st.caption("Sube un CSV con columnas: id, prediction")
+st.caption("Sube un CSV con columnas: id, prediction. El ranking es público y se actualiza al enviar tu fichero.")
 
 MODE_OPTIONS = ["Presencial", "Online"]
 
@@ -163,31 +163,75 @@ def append_log_row_to_github(row: dict):
 
 # ------------------------------ HISTORY UI ------------------------------
 
-def show_history_by_mode():
+def _render_leaderboard(df: pd.DataFrame, title: str):
+    st.markdown(f"### 🏆 {title}")
+    if df is None or df.empty:
+        st.info("Aún no hay resultados.")
+        return
+
+    # Normaliza columnas obligatorias
+    for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    # Quedarse con el mejor F1 por usuario (por modo)
+    df = df.copy()
+    df["rank_key"] = df["user_id"].astype(str).str.strip().str.lower()
+    best_by_user = (
+        df.sort_values(["rank_key", "f1_weighted", "timestamp_utc"], ascending=[True, False, False])
+          .drop_duplicates(subset=["rank_key"], keep="first")
+    )
+
+    leaderboard = (
+        best_by_user[["user_id", "f1_weighted", "n_ids", "timestamp_utc"]]
+        .sort_values(["f1_weighted", "timestamp_utc"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+    leaderboard.index = leaderboard.index + 1
+    leaderboard.rename(columns={
+        "user_id": "Nombre",
+        "f1_weighted": "F1 (weighted)",
+        "n_ids": "#IDs",
+        "timestamp_utc": "Último envío",
+    }, inplace=True)
+
+    st.dataframe(leaderboard, use_container_width=True)
+
+
+def show_public_leaderboards():
     try:
         history_df, _ = read_log_from_github()
     except Exception:
         history_df = None
 
-    st.subheader("Historial de envíos (privado)")
-    if history_df is None:
-        st.info("No hay historial disponible aún.")
+    st.subheader("Ranking público")
+    if history_df is None or history_df.empty:
+        st.info("Aún no hay envíos publicados.")
         return
 
     # Normaliza columna 'mode'
     if "mode" not in history_df.columns:
         history_df["mode"] = ""
 
-    # Siempre muestra ambas listas, aunque estén vacías
-    for mode_label in MODE_OPTIONS:
-        mode_key = mode_label.lower()
-        subset = history_df[history_df["mode"].str.lower().eq(mode_key)] if "mode" in history_df.columns else pd.DataFrame()
-        st.markdown(f"**{mode_label}**")
-        if subset is not None and not subset.empty:
-            st.dataframe(subset.sort_values("timestamp_utc", ascending=False), use_container_width=True)
-        else:
-            empty_cols = ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]
-            st.dataframe(pd.DataFrame(columns=empty_cols), use_container_width=True)
+    # Tab por modalidad
+    tabs = st.tabs(["Global", "Online", "Presencial", "Todos los envíos"])
+
+    with tabs[0]:
+        _render_leaderboard(history_df, "Mejores resultados (Global)")
+
+    with tabs[1]:
+        online = history_df[history_df["mode"].str.lower().eq("online")]
+        _render_leaderboard(online, "Mejores resultados · Online")
+
+    with tabs[2]:
+        pres = history_df[history_df["mode"].str.lower().eq("presencial")]
+        _render_leaderboard(pres, "Mejores resultados · Presencial")
+
+    with tabs[3]:
+        # Tabla completa, descendente por F1
+        full = history_df.copy()
+        full = full.sort_values(["f1_weighted", "timestamp_utc"], ascending=[False, False])
+        st.dataframe(full, use_container_width=True)
 
 # ------------------------------ MAIN UI ------------------------------
 
@@ -230,7 +274,7 @@ if run_eval and uploaded and valid_name and modes:
         user_df = pd.read_csv(io.BytesIO(user_bytes))
     except Exception as e:
         st.error(f"CSV inválido: {e}")
-        show_history_by_mode()
+        show_public_leaderboards()
         st.stop()
 
     required_user_cols = {"id", "prediction"}
@@ -238,11 +282,11 @@ if run_eval and uploaded and valid_name and modes:
 
     if not required_user_cols.issubset(user_df.columns):
         st.error("Tu CSV debe tener columnas: id, prediction")
-        show_history_by_mode()
+        show_public_leaderboards()
         st.stop()
     if not required_gt_cols.issubset(gt_df.columns):
         st.error("El ground truth no tiene columnas: id, target")
-        show_history_by_mode()
+        show_public_leaderboards()
         st.stop()
 
     # Limpieza mínima
@@ -268,7 +312,7 @@ if run_eval and uploaded and valid_name and modes:
     )
     if merged.empty:
         st.error("No hubo IDs coincidentes.")
-        show_history_by_mode()
+        show_public_leaderboards()
         st.stop()
 
     # Alinea tipos de etiquetas
@@ -299,7 +343,7 @@ if run_eval and uploaded and valid_name and modes:
             })
     except Exception as e:
         st.error(f"No se pudo calcular F1: {e}")
-        show_history_by_mode()
+        show_public_leaderboards()
         st.stop()
 
     # ----- Guardar en historial -----
@@ -320,7 +364,7 @@ if run_eval and uploaded and valid_name and modes:
         except Exception as e:
             st.warning(f"No se pudo guardar el historial ({m}): {e}")
     else:
-        st.info("Resultado(s) guardado(s) en el historial privado.")
+        st.success("Resultado(s) guardado(s) y publicado(s) en el ranking.")
 
 # ----- Mostrar historial (siempre disponible) -----
-show_history_by_mode()
+show_public_leaderboards()
