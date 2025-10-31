@@ -98,9 +98,7 @@ def _put_contents(owner_repo: str, log_path: str, content_bytes: bytes, sha: Opt
         raise RuntimeError("conflict")
     r.raise_for_status()
 
-@st.cache_data(show_spinner=False)
-def read_log_from_github() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    """Devuelve (df, sha). Si no existe, (None, None)."""
+def _read_log_from_github_nocache() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     owner_repo, _, log_path, ref = _gh_repo_paths()
     url = f"https://api.github.com/repos/{owner_repo}/contents/{log_path}?ref={ref}"
     r = requests.get(url, headers=_gh_headers(), timeout=30)
@@ -114,31 +112,62 @@ def read_log_from_github() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
     if not data:
         return pd.DataFrame(columns=["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]), sha
     df = pd.read_csv(io.BytesIO(data))
-    # Backfill de columna 'mode' si no existía
     if "mode" not in df.columns:
         df["mode"] = ""
     return df, sha
 
+@st.cache_data(show_spinner=False, ttl=10)
+def read_log_from_github() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    # pequeña caché para visualizar, pero las escrituras siempre usan la versión sin caché
+    return _read_log_from_github_nocache()
+
 
 def append_log_row_to_github(row: dict):
     """Apendiza una fila al CSV de logs en GitHub (crea si no existe).
-       Maneja el SHA y reintenta una vez si hay conflicto.
-       Para evitar duplicados por re-ejecuciones de Streamlit, se usa session_state.
+       Reintenta contra conflictos SHA haciendo re-read *sin caché*.
+       Evita duplicados en la misma sesión con session_state.
     """
     owner_repo, _, log_path, _ = _gh_repo_paths()
 
-    # Evita duplicados en la misma sesión
     key = f"logged_{row['file_sha256']}_{row['f1_weighted']}_{row['n_ids']}_{row.get('mode','')}"
     if st.session_state.get(key):
         return
 
-    # Leer log actual
-    df, sha = read_log_from_github()
-    if df is None:
-        new_df = pd.DataFrame([row])
-        csv_bytes = new_df.to_csv(index=False).encode()
-        _put_contents(owner_repo, log_path, csv_bytes, sha=None)
-        st.session_state[key] = True
+    # Intentos múltiples por concurrencia alta
+    last_exc: Optional[Exception] = None
+    for attempt in range(5):
+        try:
+            df, sha = _read_log_from_github_nocache()
+            if df is None:
+                new_df = pd.DataFrame([row])
+                csv_bytes = new_df.to_csv(index=False).encode()
+                _put_contents(owner_repo, log_path, csv_bytes, sha=None)
+            else:
+                # Alinear columnas esperadas
+                for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]:
+                    if col not in df.columns:
+                        df[col] = ""
+                new_df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+                csv_bytes = new_df.to_csv(index=False).encode()
+                _put_contents(owner_repo, log_path, csv_bytes, sha)
+            # Éxito: invalidar caché de lectura para que el ranking se actualice
+            try:
+                read_log_from_github.clear()
+            except Exception:
+                pass
+            st.session_state[key] = True
+            return
+        except RuntimeError as e:
+            last_exc = e
+            # conflicto -> reintenta
+            continue
+        except Exception as e:
+            last_exc = e
+            break
+
+    # Si llega aquí, falló tras varios intentos
+    if last_exc:
+        raise last_exc
         return
 
     # Alinea columnas esperadas
@@ -350,21 +379,27 @@ if run_eval and uploaded and valid_name and modes:
     file_sha256 = hashlib.sha256(user_bytes).hexdigest()
     timestamp_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    for m in modes:
-        row = {
-            "timestamp_utc": timestamp_utc,
-            "user_id": user_id.strip(),
-            "file_sha256": file_sha256,
-            "n_ids": int(len(merged)),
-            "f1_weighted": float(f1_w),
-            "mode": m.lower(),
-        }
-        try:
-            append_log_row_to_github(row)
-        except Exception as e:
-            st.warning(f"No se pudo guardar el historial ({m}): {e}")
-    else:
-        st.success("Resultado(s) guardado(s) y publicado(s) en el ranking.")
+    ok_modes = []
+errors = []
+for m in modes:
+    row = {
+        "timestamp_utc": timestamp_utc,
+        "user_id": user_id.strip(),
+        "file_sha256": file_sha256,
+        "n_ids": int(len(merged)),
+        "f1_weighted": float(f1_w),
+        "mode": m.lower(),
+    }
+    try:
+        append_log_row_to_github(row)
+        ok_modes.append(m)
+    except Exception as e:
+        errors.append(f"{m}: {e}")
+
+if ok_modes:
+    st.success(f"Resultado(s) publicado(s) en: {', '.join(ok_modes)}")
+if errors:
+    st.warning("No se pudo publicar en: " + ", ".join(errors))
 
 # ----- Mostrar historial (siempre disponible) -----
 show_public_leaderboards()
