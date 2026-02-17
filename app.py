@@ -7,11 +7,11 @@ from typing import Tuple, Optional
 import pandas as pd
 import requests
 import streamlit as st
-from sklearn.metrics import f1_score
+from sklearn.metrics import mean_squared_error
 
 # ------------------------------ PAGE SETUP ------------------------------
-st.set_page_config(page_title="Evaluator F1", page_icon="📊", layout="centered")
-st.title("Evaluator F1")
+st.set_page_config(page_title="Evaluator RMSE", page_icon="📉", layout="centered")
+st.title("Evaluator RMSE")
 st.caption("Sube un CSV con columnas: id, prediction. El ranking es público y se actualiza al enviar tu fichero.")
 
 MODE_OPTIONS = ["Presencial", "Online"]
@@ -37,13 +37,10 @@ def _gh_repo_paths() -> Tuple[str, str, str, str]:
 # ------------------------------ GROUND TRUTH LOADER ------------------------------
 @st.cache_data(show_spinner=False, ttl=300)
 def load_gt_from_github() -> pd.DataFrame:
-    """Carga el GT desde el repo privado. Soporta ficheros >1MB usando download_url.
-    Reintenta de forma ligera ante fallos transitorios.
-    """
+    """Carga el GT desde el repo privado. Soporta ficheros >1MB usando download_url."""
     owner_repo, gt_path, _, ref = _gh_repo_paths()
 
     url = f"https://api.github.com/repos/{owner_repo}/contents/{gt_path}?ref={ref}"
-    # Primero pedimos el JSON de metadata para evitar el límite de 1MB del 'Accept: raw'
     r = requests.get(url, headers=_gh_headers(), timeout=30)
     r.raise_for_status()
     meta = r.json()
@@ -51,7 +48,6 @@ def load_gt_from_github() -> pd.DataFrame:
     if isinstance(meta, list):
         raise RuntimeError("GT_PATH apunta a un directorio; debe ser un archivo CSV.")
 
-    # Si GitHub devuelve el contenido embebido y es pequeño, úsalo; si no, usa download_url
     content_b64: Optional[str] = meta.get("content")
     encoding: Optional[str] = meta.get("encoding")
     download_url: Optional[str] = meta.get("download_url")
@@ -63,27 +59,31 @@ def load_gt_from_github() -> pd.DataFrame:
         r2.raise_for_status()
         raw_bytes = r2.content
     else:
-        # Fallback a solicitar el raw directamente (no debería ser necesario)
         r3 = requests.get(url, headers={**_gh_headers(), "Accept": "application/vnd.github.raw"}, timeout=60)
         r3.raise_for_status()
         raw_bytes = r3.content
 
     df = pd.read_csv(io.BytesIO(raw_bytes))
-    # Validación mínima
+
     expected = {"id", "target"}
     if not expected.issubset(df.columns):
         raise ValueError("El ground truth no tiene columnas: id, target")
 
-    # Garantiza unicidad de IDs en el GT
     if df["id"].duplicated().any():
         dup_count = int(df["id"].duplicated().sum())
         st.warning(f"Se encontraron {dup_count} IDs duplicados en el ground truth; se conservará la primera ocurrencia.")
         df = df.drop_duplicates(subset=["id"], keep="first")
 
+    # Asegurar que target es numérico para RMSE
+    df["target"] = pd.to_numeric(df["target"], errors="coerce")
+    before = len(df)
+    df = df.dropna(subset=["target"])
+    if len(df) < before:
+        st.warning(f"Se eliminaron {before - len(df)} filas del GT con target no numérico/NaN.")
+
     return df[["id", "target"]]
 
 # ------------------------------ LOG HELPERS ------------------------------
-
 def _put_contents(owner_repo: str, log_path: str, content_bytes: bytes, sha: Optional[str]) -> None:
     url = f"https://api.github.com/repos/{owner_repo}/contents/{log_path}"
     body = {
@@ -110,17 +110,18 @@ def _read_log_from_github_nocache() -> Tuple[Optional[pd.DataFrame], Optional[st
     sha = j.get("sha")
     data = base64.b64decode(content_b64) if content_b64 else b""
     if not data:
-        return pd.DataFrame(columns=["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]), sha
+        return pd.DataFrame(columns=["timestamp_utc", "user_id", "file_sha256", "n_ids", "rmse", "mode"]), sha
     df = pd.read_csv(io.BytesIO(data))
     if "mode" not in df.columns:
         df["mode"] = ""
+    # compat: si venías de f1_weighted, deja columna vacía
+    if "rmse" not in df.columns:
+        df["rmse"] = pd.NA
     return df, sha
 
 @st.cache_data(show_spinner=False, ttl=10)
 def read_log_from_github() -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    # pequeña caché para visualizar, pero las escrituras siempre usan la versión sin caché
     return _read_log_from_github_nocache()
-
 
 def append_log_row_to_github(row: dict):
     """Apendiza una fila al CSV de logs en GitHub (crea si no existe).
@@ -129,13 +130,12 @@ def append_log_row_to_github(row: dict):
     """
     owner_repo, _, log_path, _ = _gh_repo_paths()
 
-    key = f"logged_{row['file_sha256']}_{row['f1_weighted']}_{row['n_ids']}_{row.get('mode','')}"
+    key = f"logged_{row['file_sha256']}_{row['rmse']}_{row['n_ids']}_{row.get('mode','')}"
     if st.session_state.get(key):
         return
 
-    # Intentos múltiples por concurrencia alta
     last_exc: Optional[Exception] = None
-    for attempt in range(5):
+    for _ in range(5):
         try:
             df, sha = _read_log_from_github_nocache()
             if df is None:
@@ -143,14 +143,12 @@ def append_log_row_to_github(row: dict):
                 csv_bytes = new_df.to_csv(index=False).encode()
                 _put_contents(owner_repo, log_path, csv_bytes, sha=None)
             else:
-                # Alinear columnas esperadas
-                for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]:
+                for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "rmse", "mode"]:
                     if col not in df.columns:
                         df[col] = ""
                 new_df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
                 csv_bytes = new_df.to_csv(index=False).encode()
                 _put_contents(owner_repo, log_path, csv_bytes, sha)
-            # Éxito: invalidar caché de lectura para que el ranking se actualice
             try:
                 read_log_from_github.clear()
             except Exception:
@@ -159,73 +157,48 @@ def append_log_row_to_github(row: dict):
             return
         except RuntimeError as e:
             last_exc = e
-            # conflicto -> reintenta
             continue
         except Exception as e:
             last_exc = e
             break
 
-    # Si llega aquí, falló tras varios intentos
     if last_exc:
         raise last_exc
-        return
-
-    # Alinea columnas esperadas
-    for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]:
-        if col not in df.columns:
-            df[col] = ""
-
-    new_df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    csv_bytes = new_df.to_csv(index=False).encode()
-    try:
-        _put_contents(owner_repo, log_path, csv_bytes, sha)
-    except RuntimeError:
-        # Reintento
-        df2, sha2 = read_log_from_github()
-        if df2 is None:
-            df2 = pd.DataFrame(columns=new_df.columns)
-        new_df2 = pd.concat([df2, pd.DataFrame([row])], ignore_index=True)
-        csv_bytes2 = new_df2.to_csv(index=False).encode()
-        _put_contents(owner_repo, log_path, csv_bytes2, sha2)
-    finally:
-        st.session_state[key] = True
 
 # ------------------------------ HISTORY UI ------------------------------
-
 def _render_leaderboard(df: pd.DataFrame, title: str):
     st.markdown(f"### 🏆 {title}")
     if df is None or df.empty:
         st.info("Aún no hay resultados.")
         return
 
-    # Normaliza columnas obligatorias
-    for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "f1_weighted", "mode"]:
+    for col in ["timestamp_utc", "user_id", "file_sha256", "n_ids", "rmse", "mode"]:
         if col not in df.columns:
             df[col] = ""
 
-    # Quedarse con el mejor F1 por usuario (por modo)
     df = df.copy()
     df["rank_key"] = df["user_id"].astype(str).str.strip().str.lower()
+
+    # En RMSE: más bajo es mejor
     best_by_user = (
-        df.sort_values(["rank_key", "f1_weighted", "timestamp_utc"], ascending=[True, False, False])
+        df.sort_values(["rank_key", "rmse", "timestamp_utc"], ascending=[True, True, False])
           .drop_duplicates(subset=["rank_key"], keep="first")
     )
 
     leaderboard = (
-        best_by_user[["user_id", "f1_weighted", "n_ids", "timestamp_utc"]]
-        .sort_values(["f1_weighted", "timestamp_utc"], ascending=[False, False])
+        best_by_user[["user_id", "rmse", "n_ids", "timestamp_utc"]]
+        .sort_values(["rmse", "timestamp_utc"], ascending=[True, False])
         .reset_index(drop=True)
     )
     leaderboard.index = leaderboard.index + 1
     leaderboard.rename(columns={
         "user_id": "Nombre",
-        "f1_weighted": "F1 (weighted)",
+        "rmse": "RMSE",
         "n_ids": "#IDs",
         "timestamp_utc": "Último envío",
     }, inplace=True)
 
     st.dataframe(leaderboard, use_container_width=True)
-
 
 def show_public_leaderboards():
     try:
@@ -238,11 +211,11 @@ def show_public_leaderboards():
         st.info("Aún no hay envíos publicados.")
         return
 
-    # Normaliza columna 'mode'
     if "mode" not in history_df.columns:
         history_df["mode"] = ""
+    if "rmse" not in history_df.columns:
+        history_df["rmse"] = pd.NA
 
-    # Tab por modalidad
     tabs = st.tabs(["Global", "Online", "Presencial", "Todos los envíos"])
 
     with tabs[0]:
@@ -257,13 +230,11 @@ def show_public_leaderboards():
         _render_leaderboard(pres, "Mejores resultados · Presencial")
 
     with tabs[3]:
-        # Tabla completa, descendente por F1
         full = history_df.copy()
-        full = full.sort_values(["f1_weighted", "timestamp_utc"], ascending=[False, False])
+        full = full.sort_values(["rmse", "timestamp_utc"], ascending=[True, False])
         st.dataframe(full, use_container_width=True)
 
 # ------------------------------ MAIN UI ------------------------------
-
 st.markdown("### 1) Sube tu CSV")
 uploaded = st.file_uploader("Tus predicciones (CSV con columnas: id, prediction)", type=["csv"])
 
@@ -286,8 +257,8 @@ if not modes:
 with st.spinner("Cargando ground truth..."):
     gt_df = load_gt_from_github()
 
-st.markdown("### 3) Calcula el F1")
-run_eval = st.button("Calcular F1")
+st.markdown("### 3) Calcula el RMSE")
+run_eval = st.button("Calcular RMSE")
 
 if run_eval:
     if not uploaded:
@@ -318,19 +289,21 @@ if run_eval and uploaded and valid_name and modes:
         show_public_leaderboards()
         st.stop()
 
-    # Limpieza mínima
+    # Deduplicar IDs del alumno
     if user_df["id"].duplicated().any():
         du = int(user_df["id"].duplicated().sum())
         st.warning(f"Tu CSV tiene {du} IDs duplicados; se conservará la primera ocurrencia.")
         user_df = user_df.drop_duplicates(subset=["id"], keep="first")
 
-    gt_df["id"], user_df["id"] = gt_df["id"].astype(str), user_df["id"].astype(str)
+    gt_df["id"] = gt_df["id"].astype(str)
+    user_df["id"] = user_df["id"].astype(str)
 
-    # Eliminar filas con NA en prediction o target
-    before = len(user_df)
+    # Asegurar numéricos (RMSE)
+    user_df["prediction"] = pd.to_numeric(user_df["prediction"], errors="coerce")
+    before_u = len(user_df)
     user_df = user_df.dropna(subset=["prediction"])
-    if len(user_df) < before:
-        st.info(f"Se eliminaron {before - len(user_df)} filas con prediction vacía.")
+    if len(user_df) < before_u:
+        st.info(f"Se eliminaron {before_u - len(user_df)} filas con prediction no numérica/NaN.")
 
     merged = pd.merge(
         gt_df[list(required_gt_cols)],
@@ -339,39 +312,35 @@ if run_eval and uploaded and valid_name and modes:
         how="inner",
         validate="one_to_one",
     )
+
     if merged.empty:
         st.error("No hubo IDs coincidentes.")
         show_public_leaderboards()
         st.stop()
 
-    # Alinea tipos de etiquetas
-    try:
-        if pd.api.types.is_numeric_dtype(merged["target"]) and not pd.api.types.is_numeric_dtype(merged["prediction"]):
-            merged["prediction"] = pd.to_numeric(merged["prediction"], errors="coerce")
-        elif not pd.api.types.is_numeric_dtype(merged["target"]) and pd.api.types.is_numeric_dtype(merged["prediction"]):
-            merged["prediction"] = merged["prediction"].astype(str)
-    except Exception:
-        pass
-
+    # target ya numérico desde load_gt_from_github(), pero por seguridad:
+    merged["target"] = pd.to_numeric(merged["target"], errors="coerce")
     na_before = len(merged)
     merged = merged.dropna(subset=["target", "prediction"])
     if len(merged) < na_before:
-        st.info(f"Se eliminaron {na_before - len(merged)} filas con etiquetas no válidas tras normalización.")
+        st.info(f"Se eliminaron {na_before - len(merged)} filas con valores no válidos tras normalización.")
 
-    # Cálculo del F1
+    # Cálculo del RMSE
     try:
-        f1_w = f1_score(merged["target"], merged["prediction"], average="weighted")
-        st.success(f"F1-score (weighted): {f1_w:.4f}")
+        rmse = float(mean_squared_error(merged["target"], merged["prediction"], squared=False))
+        st.success(f"RMSE: {rmse:.6f}")
         with st.expander("Detalles del conjunto evaluado"):
             st.write({
                 "n_ids_merged": int(len(merged)),
                 "n_gt": int(len(gt_df)),
                 "n_user": int(len(user_df)),
-                "n_unique_targets": int(merged["target"].nunique()),
-                "n_unique_predictions": int(merged["prediction"].nunique()),
+                "target_min": float(merged["target"].min()),
+                "target_max": float(merged["target"].max()),
+                "pred_min": float(merged["prediction"].min()),
+                "pred_max": float(merged["prediction"].max()),
             })
     except Exception as e:
-        st.error(f"No se pudo calcular F1: {e}")
+        st.error(f"No se pudo calcular RMSE: {e}")
         show_public_leaderboards()
         st.stop()
 
@@ -380,26 +349,26 @@ if run_eval and uploaded and valid_name and modes:
     timestamp_utc = dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     ok_modes = []
-errors = []
-for m in modes:
-    row = {
-        "timestamp_utc": timestamp_utc,
-        "user_id": user_id.strip(),
-        "file_sha256": file_sha256,
-        "n_ids": int(len(merged)),
-        "f1_weighted": float(f1_w),
-        "mode": m.lower(),
-    }
-    try:
-        append_log_row_to_github(row)
-        ok_modes.append(m)
-    except Exception as e:
-        errors.append(f"{m}: {e}")
+    errors = []
+    for m in modes:
+        row = {
+            "timestamp_utc": timestamp_utc,
+            "user_id": user_id.strip(),
+            #"file_sha256": file_sha256,
+            "n_ids": int(len(merged)),
+            "rmse": float(rmse),
+            "mode": m.lower(),
+        }
+        try:
+            append_log_row_to_github(row)
+            ok_modes.append(m)
+        except Exception as e:
+            errors.append(f"{m}: {e}")
 
-if ok_modes:
-    st.success(f"Resultado(s) publicado(s) en: {', '.join(ok_modes)}")
-if errors:
-    st.warning("No se pudo publicar en: " + ", ".join(errors))
+    if ok_modes:
+        st.success(f"Resultado(s) publicado(s) en: {', '.join(ok_modes)}")
+    if errors:
+        st.warning("No se pudo publicar en: " + ", ".join(errors))
 
 # ----- Mostrar historial (siempre disponible) -----
 show_public_leaderboards()
