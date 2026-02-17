@@ -327,7 +327,8 @@ if run_eval and uploaded and valid_name and modes:
 
     # Cálculo del RMSE
     try:
-        rmse = float(mean_squared_error(merged["target"], merged["prediction"], squared=False))
+        mse = float(mean_squared_error(merged["target"], merged["prediction"]))
+        rmse = mse ** 0.5
         st.success(f"RMSE: {rmse:.6f}")
         with st.expander("Detalles del conjunto evaluado"):
             st.write({
