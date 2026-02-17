@@ -355,7 +355,7 @@ if run_eval and uploaded and valid_name and modes:
         row = {
             "timestamp_utc": timestamp_utc,
             "user_id": user_id.strip(),
-            #"file_sha256": file_sha256,
+            "file_sha256": file_sha256,
             "n_ids": int(len(merged)),
             "rmse": float(rmse),
             "mode": m.lower(),
